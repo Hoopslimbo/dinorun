@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>BODY RUNNER — you are the controller</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;overflow:hidden;background:#020608;touch-action:none;}
+  body{font-family:"SF Mono","Courier New",monospace;color:#bfefff;}
+  #game{position:fixed;inset:0;}
+  #cam{position:fixed;right:14px;bottom:14px;width:200px;height:150px;z-index:5;
+    border:1px solid #00f0ff;border-radius:8px;transform:scaleX(-1);opacity:.9;
+    box-shadow:0 0 18px rgba(0,240,255,.35);}
+  #camlabel{position:fixed;right:14px;bottom:168px;z-index:5;font-size:10px;letter-spacing:3px;color:#00f0ff;}
+  #ui{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:18px;background:rgba(1,6,10,.88);text-align:center;padding:20px;}
+  #ui h1{font-size:clamp(28px,6vw,54px);letter-spacing:8px;color:#00f0ff;text-shadow:0 0 24px rgba(0,240,255,.7);}
+  #ui p{color:#7fb6c2;font-size:14px;max-width:520px;line-height:1.8;letter-spacing:1px;}
+  #ui p b{color:#eafcff;}
+  #bigbtn{background:none;border:2px solid #00f0ff;color:#00f0ff;font-size:18px;letter-spacing:4px;
+    padding:16px 44px;border-radius:999px;cursor:pointer;font-family:inherit;
+    box-shadow:0 0 20px rgba(0,240,255,.35);transition:.15s;}
+  #bigbtn:hover{background:rgba(0,240,255,.12);}
+  #err{color:#ff5b5b;font-size:13px;max-width:80vw;min-height:20px;}
+  #hud{position:fixed;top:14px;left:16px;z-index:6;font-size:13px;letter-spacing:3px;color:#00f0ff;
+    text-shadow:0 0 10px rgba(0,240,255,.6);pointer-events:none;}
+  #hudr{position:fixed;top:14px;right:16px;z-index:6;font-size:13px;letter-spacing:3px;color:#ffb300;
+    text-shadow:0 0 10px rgba(255,179,0,.6);pointer-events:none;}
+  #msg{position:fixed;top:22%;left:0;right:0;z-index:6;text-align:center;font-size:clamp(20px,4vw,36px);
+    letter-spacing:6px;color:#eafcff;text-shadow:0 0 18px rgba(0,240,255,.8);pointer-events:none;display:none;}
+  #pose{position:fixed;left:14px;bottom:14px;z-index:6;font-size:11px;letter-spacing:2px;color:#3f7a86;pointer-events:none;}
+  #rotate{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;
+    background:rgba(1,6,10,.92);color:#00f0ff;font-size:22px;letter-spacing:5px;text-align:center;padding:20px;}
+  .hidden{display:none!important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="camlabel">YOU</div>
+<div id="hud">SCORE <span id="score">0</span></div>
+<div id="hudr">BEST <span id="best">0</span></div>
+<div id="msg"></div>
+<div id="pose">POSE: --</div>
+<div id="rotate">↻<br><br>ROTATE YOUR IPAD<br>SIDWAYS TO PLAY</div>
+<div id="ui">
+  <h1>BODY RUNNER</h1>
+  <p>The dino game, but <b>you</b> are the controller.<br><br>
+  <b>JUMP</b> in real life to jump. <b>SQUAT / DUCK</b> to slide under barriers.<br>
+  Stand back so your whole body is in frame.<br><br>
+  Keyboard works too: <b>SPACE</b> = jump, <b>↓</b> = duck.<br><br>
+  On iPad: open this from your GitHub Pages link (camera needs https),<br>then Add to Home Screen and play sideways.</p>
+  <button id="bigbtn">TAP TO START</button>
+  <div id="err"></div>
+</div>
+<script type="module">
+import {FilesetResolver,PoseLandmarker} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+const $=id=>document.getElementById(id);
+const canvas=$("game"),ctx=canvas.getContext("2d");
+const video=$("cam");
+function fit(){canvas.width=innerWidth;canvas.height=innerHeight;}
+addEventListener("resize",fit);fit();
+
+const VISION_URL="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const POSE_URL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/task.tfm";
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+/* ================= body -> controls =================
+   hips (23,24) drive everything. y is down in image coords.
+   Calibrate a standing baseline, then:
+   - JUMP: hip velocity upward spikes past threshold
+   - DUCK: hips sink below baseline (with hysteresis) */
+const BC={sy:null,sv:0,py:null,base:null,cool:0,duck:false};
+const JUMP_VEL=0.011,DUCK_ON=0.10,DUCK_OFF=0.05;
+function resetBody(){BC.sy=null;BC.sv=0;BC.py=null;BC.base=null;BC.cool=0;BC.duck=false;}
+function hipY(lm){return (lm[23].y+lm[24].y)/2;}
+function bodyVisible(lm){var v23=lm[23].visibility==null?1:lm[23].visibility,
+  v24=lm[24].visibility==null?1:lm[24].visibility;return v23>0.4&&v24>0.4;}
+function updateBody(lm,now){
+  // returns "jump" | "duck" | "stand" | "hidden"
+  if(!bodyVisible(lm))return "hidden";
+  const y=hipY(lm);
+  BC.sy=BC.sy==null?y:lerp(BC.sy,y,0.5);
+  const v=BC.py==null?0:BC.py-BC.sy; // >0 = moving up
+  BC.py=BC.sy;
+  BC.sv=lerp(BC.sv,v,0.4);
+  if(BC.base==null)return "stand"; // still calibrating
+  if(now<BC.cool){BC.duck=(BC.sy-BC.base)>DUCK_OFF;return BC.duck?"duck":"stand";}
+  if(!BC.duck&&BC.sv>JUMP_VEL){BC.cool=now+450;BC.duck=false;return "jump";}
+  if(!BC.duck&&(BC.sy-BC.base)>DUCK_ON)BC.duck=true;
+  else if(BC.duck&&(BC.sy-BC.base)<DUCK_OFF)BC.duck=false;
+  return BC.duck?"duck":"stand";
+}
+function calibrate(lm){ // feed standing frames, returns true when baseline locked
+  if(!bodyVisible(lm))return false;
+  const y=hipY(lm);
+  BC.base=BC.base==null?y:lerp(BC.base,y,0.2);
+  return true;
+}
+
+/* ================= game ================= */
+const G={state:"menu",score:0,best:+(localStorage.getItem("br_best")||0),
+  speed:6,dist:0,spawnIn:0,obs:[],parts:[],
+  p:{x:0,y:0,vy:0,duck:false,air:false},ground:0,shake:0,msgT:0};
+$("best").textContent=G.best;
+function groundY(){return canvas.height-90;}
+function reset(){
+  G.score=0;G.dist=0;G.speed=6;G.spawnIn=90;G.obs=[];G.parts=[];
+  G.p={x:Math.min(180,canvas.width*0.2),y:0,vy:0,duck:false,air:false};
+  G.ground=groundY();
+}
+function jump(){
+  if(G.state!=="play")return;
+  if(!G.p.air){G.p.vy=-16.5;G.p.air=true;G.p.duck=false;burst(G.p.x,groundY()-10,10,"#00f0ff");}
+}
+function setDuck(d){if(G.state==="play"&&!G.p.air)G.p.duck=d;}
+function burst(x,y,n,col){
+  for(let i=0;i<n;i++)G.parts.push({x,y,vx:(Math.random()-0.5)*6,vy:-Math.random()*5-1,
+    life:1,col,r:2+Math.random()*3});
+}
+function spawn(){
+  const r=Math.random();
+  const w=34+Math.random()*22;
+  if(r<0.55){ // low barrier — JUMP
+    const h=44+Math.random()*26;
+    G.obs.push({x:canvas.width+40,w,h,y:groundY()-h,duck:false});
+  }else{ // high barrier — DUCK under it
+    const gapTop=groundY()-118,hh=44;
+    G.obs.push({x:canvas.width+40,w,h:hh,y:gapTop,duck:true});
+  }
+}
+function rectsHit(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+function playerBox(){
+  const h=G.p.duck?34:74,w=34;
+  return {x:G.p.x,y:groundY()-G.p.y-h,w,h};
+}
+function die(){
+  G.state="dead";G.shake=14;burst(G.p.x,groundY()-G.p.y-40,26,"#ff5b5b");
+  if(G.score>G.best){G.best=G.score;localStorage.setItem("br_best",G.best);$("best").textContent=G.best;}
+  showMsg("WIPED OUT — JUMP TO RETRY",1e9);
+}
+function showMsg(t,ms){const m=$("msg");m.textContent=t;m.style.display="block";
+  clearTimeout(G.msgT);if(ms<1e9)G.msgT=setTimeout(()=>m.style.display="none",ms);}
+function step(){
+  // physics
+  if(G.p.air){
+    G.p.vy+=0.9;G.p.y+=G.p.vy;
+    if(G.p.y<=0){G.p.y=0;G.p.vy=0;G.p.air=false;burst(G.p.x,groundY()-6,8,"#2a7a8a");}
+  }
+  // obstacles
+  G.spawnIn--;
+  if(G.spawnIn<=0){spawn();G.spawnIn=Math.max(46,150-G.speed*6)+Math.random()*70;}
+  const pb=playerBox();
+  for(const o of G.obs){
+    o.x-=G.speed;
+    if(rectsHit(pb,o)){die();break;}
+  }
+  G.obs=G.obs.filter(o=>o.x+o.w>-60);
+  // particles
+  for(const p of G.parts){p.x+=p.vx;p.y+=p.vy;p.vy+=0.25;p.life-=0.03;}
+  G.parts=G.parts.filter(p=>p.life>0);
+  // score + difficulty
+  G.dist+=G.speed;G.score=Math.floor(G.dist/10);
+  G.speed=Math.min(14,6+G.score*0.012);
+  $("score").textContent=G.score;
+  if(G.shake>0)G.shake*=0.88;
+}
+function draw(){
+  ctx.save();
+  if(G.shake>0.5)ctx.translate((Math.random()-0.5)*G.shake,(Math.random()-0.5)*G.shake);
+  // bg
+  const gr=ctx.createLinearGradient(0,0,0,canvas.height);
+  gr.addColorStop(0,"#020608");gr.addColorStop(0.7,"#04141c");gr.addColorStop(1,"#020608");
+  ctx.fillStyle=gr;ctx.fillRect(-20,-20,canvas.width+40,canvas.height+40);
+  // scrolling grid floor
+  ctx.strokeStyle="rgba(0,240,255,.18)";ctx.lineWidth=1;
+  const gy=groundY(),off=(G.dist%60);
+  ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(canvas.width,gy);
+  ctx.strokeStyle="rgba(0,240,255,.5)";ctx.lineWidth=2;ctx.stroke();
+  ctx.strokeStyle="rgba(0,240,255,.12)";ctx.lineWidth=1;ctx.beginPath();
+  for(let x=-off;x<canvas.width;x+=60){ctx.moveTo(x,gy);ctx.lineTo(x-40,canvas.height);}
+  for(let y=gy+24;y<canvas.height;y+=28){ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);}
+  ctx.stroke();
+  // stars
+  ctx.fillStyle="rgba(160,220,235,.5)";
+  for(let i=0;i<40;i++){
+    const sx=((i*197.3-G.dist*0.3)%(canvas.width+40)+(canvas.width+40))%(canvas.width+40)-20;
+    ctx.fillRect(sx,(i*89.7)%(gy-40),2,2);
+  }
+  // obstacles
+  for(const o of G.obs){
+    ctx.save();ctx.shadowColor=o.duck?"#b44dff":"#ff5b5b";ctx.shadowBlur=16;
+    ctx.fillStyle=o.duck?"rgba(180,77,255,.85)":"rgba(255,91,91,.85)";
+    ctx.fillRect(o.x,o.y,o.w,o.h);
+    ctx.fillStyle="rgba(255,255,255,.25)";ctx.fillRect(o.x,o.y,o.w,5);
+    ctx.restore();
+  }
+  // player — glowing runner
+  const pb=playerBox(),px=pb.x+pb.w/2,pyb=pb.y+pb.h;
+  ctx.save();ctx.shadowColor="#00f0ff";ctx.shadowBlur=22;
+  ctx.fillStyle="#00f0ff";
+  const bob=G.p.air?0:Math.sin(performance.now()*0.02)*3;
+  if(G.p.duck){ctx.beginPath();ctx.ellipse(px,pyb-17,26,17,0,0,Math.PI*2);ctx.fill();}
+  else{
+    ctx.beginPath();ctx.arc(px,pyb-52+bob*0.3,13,0,Math.PI*2);ctx.fill(); // head
+    ctx.fillRect(px-9,pyb-42+bob*0.3,18,30); // torso
+    const lp=Math.sin(performance.now()*0.025)*10;
+    ctx.fillRect(px-11,pyb-14,8,14+lp*0.3);ctx.fillRect(px+3,pyb-14,8,14-lp*0.3); // legs
+  }
+  ctx.restore();
+  // trail
+  if(G.state==="play"&&G.speed>8){
+    ctx.strokeStyle="rgba(0,240,255,.25)";ctx.lineWidth=3;
+    for(let i=0;i<3;i++){ctx.beginPath();ctx.moveTo(pb.x-10-i*22,pyb-30);ctx.lineTo(pb.x-30-i*22,pyb-30);ctx.stroke();}
+  }
+  // particles
+  for(const p of G.parts){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.col;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();}
+  ctx.globalAlpha=1;
+  ctx.restore();
+}
+
+/* ================= pose + main loop ================= */
+let landmarker=null,lastT=0,calT=0,calN=0,cdT=0;
+$("bigbtn").onclick=start;
+async function start(){
+  $("bigbtn").disabled=true;$("err").textContent="";
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:"user"}});
+    video.srcObject=stream;await video.play();
+  }catch(e){$("err").textContent="Camera blocked — check the camera permission.";$("bigbtn").disabled=false;return;}
+  try{
+    const vision=await FilesetResolver.forVisionTasks(VISION_URL);
+    landmarker=await PoseLandmarker.createFromOptions(vision,{
+      baseOptions:{modelAssetPath:POSE_URL,delegate:"GPU"},runningMode:"VIDEO",numPoses:1});
+  }catch(e){
+    try{
+      const vision=await FilesetResolver.forVisionTasks(VISION_URL);
+      landmarker=await PoseLandmarker.createFromOptions(vision,{
+        baseOptions:{modelAssetPath:POSE_URL,delegate:"CPU"},runningMode:"VIDEO",numPoses:1});
+    }catch(e2){$("err").textContent="Could not load the pose tracker. Try Chrome.";$("bigbtn").disabled=false;return;}
+  }
+  $("ui").classList.add("hidden");
+  resetBody();reset();
+  G.state="calibrate";calT=performance.now();calN=0;
+  showMsg("STAND STILL…",1e9);
+  requestAnimationFrame(loop);
+}
+let lastPose="--",poseT=0;
+function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now();
+  let lm=null;
+  if(video.readyState>=2&&now>lastT){
+    lastT=now;
+    try{const r=landmarker.detectForVideo(video,now);lm=(r.landmarks&&r.landmarks[0])||null;}
+    catch(e){lm=null;}
+  }
+  if(G.state==="calibrate"){
+    if(lm&&calibrate(lm))calN++;
+    if(now-calT>2200&&calN>20){G.state="countdown";cdT=now;showMsg("3",1e9);}
+    else if(now-calT>2200){calT=now;calN=0;} // not visible — keep waiting
+    draw();return;
+  }
+  if(G.state==="countdown"){
+    const s=3-Math.floor((now-cdT)/700);
+    if(s<=0){G.state="play";$("msg").style.display="none";reset();}
+    else showMsg(String(s),1e9);
+    draw();return;
+  }
+  if(lm){
+    const cmd=updateBody(lm,now);
+    if(now-poseT>200){poseT=now;lastPose=cmd.toUpperCase();$("pose").textContent="POSE: "+lastPose;}
+    if(G.state==="play"){
+      if(cmd==="jump")jump();
+      else if(cmd==="duck")setDuck(true);
+      else if(cmd==="stand")setDuck(false);
+    }else if(G.state==="dead"&&cmd==="jump"){ // jump to retry
+      $("msg").style.display="none";resetBody();reset();G.state="play";
+    }
+  }else if(now-poseT>500){$("pose").textContent="POSE: STEP INTO FRAME";}
+  if(G.state==="play")step();
+  draw();
+}
+// keyboard fallback (also handy for testing)
+addEventListener("keydown",e=>{
+  if(e.code==="Space"){e.preventDefault();
+    if(G.state==="dead"){$("msg").style.display="none";resetBody();reset();G.state="play";}
+    else jump();}
+  if(e.code==="ArrowDown")setDuck(true);
+});
+addEventListener("keyup",e=>{if(e.code==="ArrowDown")setDuck(false);});
+canvas.addEventListener("pointerdown",()=>{
+  if(G.state==="dead"){$("msg").style.display="none";resetBody();reset();G.state="play";}
+});
+// touch fallback for old iPads (no PointerEvent)
+canvas.addEventListener("touchstart",e=>{e.preventDefault();
+  if(G.state==="dead"){$("msg").style.display="none";resetBody();reset();G.state="play";}
+},{passive:false});
+// rotate hint for phones/tablets held upright
+function checkRotate(){$("rotate").style.display=(innerHeight>innerWidth&&innerWidth<900)?"flex":"none";}
+addEventListener("resize",checkRotate);checkRotate();
+draw(); // menu backdrop
+</script>
+</body>
+</html>
